@@ -9,9 +9,11 @@
         "ec2:DescribeAddresses",
         "ec2:DescribeSnapshots",
         "ec2:DescribeImages",
+        "ec2:DescribeNatGateways",
         "elasticloadbalancing:DescribeLoadBalancers",
         "elasticloadbalancing:DescribeTargetGroups",
         "elasticloadbalancing:DescribeTargetHealth",
+        "rds:DescribeDBInstances",
         "cloudwatch:GetMetricData"
       ],
       "Resource": "*"

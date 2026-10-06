@@ -1,0 +1,28 @@
+name: scan
+# Varredura semanal somente leitura. Precisa da variável de repositório AWS_ROLE_ARN
+# (role OIDC com a política iam-policy.json) e, opcional, do secret WEBHOOK_URL.
+on:
+  schedule:
+    - cron: "0 11 * * 1"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  scan:
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: pip install boto3
+      - run: python orphan_hunter.py ${{ secrets.WEBHOOK_URL && format('--webhook {0}', secrets.WEBHOOK_URL) || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orphans
+          path: orphans.*

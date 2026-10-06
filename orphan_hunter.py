@@ -1,6 +1,8 @@
 """Orphan Hunter: varredura SOMENTE LEITURA de recursos AWS provavelmente órfãos."""
 import argparse
-import sys
+import html
+import json
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -11,8 +13,11 @@ EIP_MONTH = 3.60  # IPv4 público: US$ 0,005/h (validado)
 WINDOW_DAYS = 14
 
 # Preços US$. Só entra o que foi validado; ausente => custo "?" (preço não validado).
-# Chaves: ebs_gb[(região, tipo_volume)], snapshot_gb[região], lb_hour[(região, "application"|"network")]
+# Chaves: ebs_gb[(região, tipo_volume)], snapshot_gb[região], lb_hour[(região, "application"|"network")],
+# nat_hour[região], rds_hour[(região, classe_instância)] (só instância; storage não incluso)
 PRICES = {
+    "nat_hour": {},     # (a validar)
+    "rds_hour": {},     # (a validar)
     "ebs_gb": {},       # (a validar) Pricing API: pricing:GetProducts
     "snapshot_gb": {},  # (a validar)
     "lb_hour": {},      # (a validar)
@@ -32,6 +37,12 @@ def monthly_cost(kind, region, qty=1, sub=None):
     if kind == "lb":
         p = PRICES["lb_hour"].get((region, sub))
         return None if p is None else HOURS_MONTH * p
+    if kind == "nat":
+        p = PRICES["nat_hour"].get(region)
+        return None if p is None else HOURS_MONTH * p
+    if kind == "rds":
+        p = PRICES["rds_hour"].get((region, sub))
+        return None if p is None else HOURS_MONTH * p
     raise ValueError(kind)
 
 
@@ -39,9 +50,10 @@ def age_days(dt):
     return (datetime.now(timezone.utc) - dt).days if dt else None
 
 
-def finding(kind, rid, region, cost, age, reason, confidence, note=""):
+def finding(kind, rid, region, cost, age, reason, confidence, note="", ref=None):
+    """ref = identificador usado pelo cleanup.py (ex.: ARN do LB); padrão é o id."""
     return dict(kind=kind, id=rid, region=region, cost=cost, age=age,
-                reason=reason, confidence=confidence, note=note)
+                reason=reason, confidence=confidence, note=note, ref=ref or rid)
 
 
 def paginate(client, op, key, **kw):
@@ -85,15 +97,19 @@ def detect_snapshots(ec2, region):
     return out
 
 
+def metric_sum(cw, ns, metric, dim_name, dim_value, start, end, stat="Sum"):
+    q = [{"Id": "m", "MetricStat": {"Metric": {"Namespace": ns, "MetricName": metric,
+          "Dimensions": [{"Name": dim_name, "Value": dim_value}]},
+          "Period": 86400, "Stat": stat}}]
+    res = cw.get_metric_data(MetricDataQueries=q, StartTime=start, EndTime=end)
+    return sum(res["MetricDataResults"][0]["Values"])
+
+
 def lb_traffic(cw, lb, start, end):
     ns, metric = (("AWS/ApplicationELB", "RequestCount") if lb["Type"] == "application"
                   else ("AWS/NetworkELB", "ProcessedBytes"))
     dim = lb["LoadBalancerArn"].split("loadbalancer/")[1]
-    q = [{"Id": "m", "MetricStat": {"Metric": {"Namespace": ns, "MetricName": metric,
-          "Dimensions": [{"Name": "LoadBalancer", "Value": dim}]},
-          "Period": 86400, "Stat": "Sum"}}]
-    res = cw.get_metric_data(MetricDataQueries=q, StartTime=start, EndTime=end)
-    return sum(res["MetricDataResults"][0]["Values"]), metric
+    return metric_sum(cw, ns, metric, "LoadBalancer", dim, start, end), metric
 
 
 def detect_lbs(elb, cw, region):
@@ -111,12 +127,48 @@ def detect_lbs(elb, cw, region):
                     ["TargetHealthDescriptions"]) for t in tgs)
         if n == 0:
             out.append(finding("LB", lb["LoadBalancerName"], region, cost, age,
-                               f"{lb['Type']} sem nenhum target registrado", "alta"))
+                               f"{lb['Type']} sem nenhum target registrado", "alta",
+                               ref=lb["LoadBalancerArn"]))
             continue
         total, metric = lb_traffic(cw, lb, start, end)
         if total == 0:
             out.append(finding("LB", lb["LoadBalancerName"], region, cost, age,
-                               f"{n} targets, mas {metric}=0 em {WINDOW_DAYS} dias", "média"))
+                               f"{n} targets, mas {metric}=0 em {WINDOW_DAYS} dias", "média",
+                               ref=lb["LoadBalancerArn"]))
+    return out
+
+
+def detect_nat(ec2, cw, region):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=WINDOW_DAYS)
+    out = []
+    for n in paginate(ec2, "describe_nat_gateways", "NatGateways",
+                      Filter=[{"Name": "state", "Values": ["available"]}]):
+        sent = metric_sum(cw, "AWS/NATGateway", "BytesOutToDestination", "NatGatewayId",
+                          n["NatGatewayId"], start, end)
+        if sent == 0:
+            out.append(finding("NAT", n["NatGatewayId"], region, monthly_cost("nat", region),
+                               age_days(n["CreateTime"]),
+                               f"BytesOutToDestination=0 em {WINDOW_DAYS} dias", "média",
+                               "não inclui custo do tráfego nem do IP"))
+    return out
+
+
+def detect_rds(rds, cw, region):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=WINDOW_DAYS)
+    out = []
+    for d in paginate(rds, "describe_db_instances", "DBInstances"):
+        if d["DBInstanceStatus"] != "available":
+            continue
+        conns = metric_sum(cw, "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier",
+                           d["DBInstanceIdentifier"], start, end, stat="Maximum")
+        if conns == 0:
+            out.append(finding("RDS", d["DBInstanceIdentifier"], region,
+                               monthly_cost("rds", region, sub=d["DBInstanceClass"]),
+                               age_days(d["InstanceCreateTime"]),
+                               f"{d['DBInstanceClass']} com 0 conexões em {WINDOW_DAYS} dias", "média",
+                               "só instância; storage e backups não inclusos"))
     return out
 
 
@@ -125,14 +177,19 @@ def rank(findings):
     return sorted(findings, key=lambda f: (f["cost"] is None, -(f["cost"] or 0)))
 
 
-def report(findings, warnings, usd_brl=None):
+def summary(findings, usd_brl=None):
     known = sum(f["cost"] for f in findings if f["cost"] is not None)
     unk = sum(f["cost"] is None for f in findings)
-    total = f"**Total conhecido: US$ {known:.2f}/mês**"
+    total = f"Total conhecido: US$ {known:.2f}/mês"
     if usd_brl:
         total += f" (R$ {known * usd_brl:.2f} a {usd_brl})"
     if unk:
-        total += f" + {unk} item(ns) com preço não validado (`?`)"
+        total += f" + {unk} item(ns) com preço não validado (?)"
+    return total
+
+
+def report(findings, warnings, usd_brl=None):
+    total = f"**{summary(findings, usd_brl)}**"
     lines = ["# Orphan Hunter", "", total, "",
              "| Tipo | ID | Região | Custo/mês | Idade (dias) | Motivo | Confiança |",
              "|---|---|---|---|---|---|---|"]
@@ -147,15 +204,44 @@ def report(findings, warnings, usd_brl=None):
     return "\n".join(lines) + "\n"
 
 
+def report_html(findings, warnings, usd_brl=None):
+    e = html.escape
+    rows = "".join(
+        "<tr>" + "".join(f"<td>{e(str(c))}</td>" for c in (
+            f["kind"], f["id"], f["region"],
+            "? (preço não validado)" if f["cost"] is None else f"US$ {f['cost']:.2f}",
+            "-" if f["age"] is None else f["age"],
+            f["reason"] + (f" ({f['note']})" if f["note"] else ""), f["confidence"])) + "</tr>"
+        for f in findings)
+    head = "".join(f"<th>{h}</th>" for h in
+                   ("Tipo", "ID", "Região", "Custo/mês", "Idade (dias)", "Motivo", "Confiança"))
+    warn = "".join(f"<li>{e(w)}</li>" for w in warnings)
+    return ("<!doctype html><meta charset=utf-8><title>Orphan Hunter</title>"
+            "<style>body{font:14px sans-serif;margin:2em}td,th{border:1px solid #ccc;padding:4px 8px}"
+            "table{border-collapse:collapse}</style><h1>Orphan Hunter</h1>"
+            f"<p>{e(summary(findings, usd_brl))}</p><table><tr>{head}</tr>{rows}</table>"
+            + (f"<h2>Avisos</h2><ul>{warn}</ul>" if warn else ""))
+
+
+def notify(url, text):
+    """Webhook compatível com Slack/Discord ({"text": ...}). Só stdlib."""
+    req = urllib.request.Request(url, json.dumps({"text": text}).encode(),
+                                 {"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+
+
 def scan(regions, warnings):
     found = []
     for r in regions:
         ec2 = boto3.client("ec2", region_name=r)
         elb = boto3.client("elbv2", region_name=r)
+        rds = boto3.client("rds", region_name=r)
         cw = boto3.client("cloudwatch", region_name=r)
         for name, fn in (("EBS", lambda: detect_ebs(ec2, r)), ("EIP", lambda: detect_eip(ec2, r)),
                          ("Snapshot", lambda: detect_snapshots(ec2, r)),
-                         ("LB", lambda: detect_lbs(elb, cw, r))):
+                         ("LB", lambda: detect_lbs(elb, cw, r)),
+                         ("NAT", lambda: detect_nat(ec2, cw, r)),
+                         ("RDS", lambda: detect_rds(rds, cw, r))):
             try:
                 found += fn()
             except (ClientError, BotoCoreError) as e:
@@ -167,6 +253,7 @@ def main():
     ap = argparse.ArgumentParser(description="Varredura somente leitura de recursos AWS órfãos")
     ap.add_argument("--regions", help="ex.: sa-east-1,us-east-1 (padrão: todas habilitadas)")
     ap.add_argument("--usd-brl", type=float, help="taxa de câmbio informada por você")
+    ap.add_argument("--webhook", help="URL de webhook (Slack etc.) para enviar o resumo")
     ap.add_argument("--demo", action="store_true", help="roda a checagem com dados fictícios")
     a = ap.parse_args()
     if a.demo:
@@ -174,10 +261,15 @@ def main():
     warnings = []
     regions = a.regions.split(",") if a.regions else [
         r["RegionName"] for r in boto3.client("ec2", region_name="us-east-1").describe_regions()["Regions"]]
-    md = report(rank(scan(regions, warnings)), warnings, a.usd_brl)
+    found = rank(scan(regions, warnings))
+    md = report(found, warnings, a.usd_brl)
     print(md)
-    with open("orphans.md", "w", encoding="utf-8") as f:
-        f.write(md)
+    for name, content in (("orphans.md", md), ("orphans.html", report_html(found, warnings, a.usd_brl)),
+                          ("orphans.json", json.dumps(found, indent=1))):
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(content)
+    if a.webhook:
+        notify(a.webhook, f"Orphan Hunter: {len(found)} achados. {summary(found, a.usd_brl)}")
 
 
 def demo():
@@ -190,6 +282,8 @@ def demo():
     assert [f["id"] for f in rank(fs)] == ["3", "2", "1"]
     out = report(rank(fs), ["aviso"], 5.0)
     assert "US$ 13.60" in out and "R$ 68.00" in out and "1 item(ns)" in out and "- aviso" in out
+    h = report_html([finding("A", "<x>", "x", 1.0, 1, "r", "alta")], [])
+    assert "&lt;x&gt;" in h and "<x>" not in h
     print("demo OK")
 
 
