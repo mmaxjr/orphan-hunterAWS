@@ -2,7 +2,7 @@
 
 Script Python (boto3) **somente leitura** que varre uma conta AWS e gera um ranking, em US$ por mês, de recursos prováveis órfãos (que você paga e provavelmente não usa).
 
-> Status: especificação. O código ainda será construído a partir de [orphan-hunter-prompt.md](orphan-hunter-prompt.md).
+> Especificação original: [orphan-hunter-prompt.md](orphan-hunter-prompt.md).
 
 ## Como funciona
 
@@ -22,8 +22,19 @@ Script Python (boto3) **somente leitura** que varre uma conta AWS e gera um rank
 ## Uso previsto
 
 ```bash
+pip install boto3
 python orphan_hunter.py --regions sa-east-1,us-east-1 --usd-brl 5.50
+python orphan_hunter.py --demo   # checagem com dados fictícios
 ```
+
+Usa as credenciais AWS padrão do boto3. Gera `orphans.md`. A política mínima está em [iam-policy.json](iam-policy.json).
+
+## Limites conhecidos
+
+- Só o preço do IPv4 está validado. Preços de EBS, snapshot e LB estão `(a validar)` em `PRICES`; até lá o custo aparece como `?`.
+- Classic Load Balancer fora do escopo; só ALB/NLB.
+- Não foi executado contra uma conta real ainda.
+- Idade do EBS é a do volume, não há quanto tempo está `available`.
 
 ## Princípios
 
